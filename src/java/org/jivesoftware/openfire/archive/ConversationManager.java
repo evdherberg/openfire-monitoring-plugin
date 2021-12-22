@@ -29,14 +29,23 @@ import org.jivesoftware.openfire.archive.cluster.GetConversationTask;
 import org.jivesoftware.openfire.archive.cluster.GetConversationsTask;
 import org.jivesoftware.openfire.archive.cluster.GetConversationsWriteETATask;
 import org.jivesoftware.openfire.cluster.ClusterManager;
+import org.jivesoftware.openfire.cluster.NodeID;
 import org.jivesoftware.openfire.component.ComponentEventListener;
 import org.jivesoftware.openfire.component.InternalComponentManager;
+import org.jivesoftware.openfire.exceptions.PluginVersionException;
 import org.jivesoftware.openfire.muc.MultiUserChatService;
 import org.jivesoftware.openfire.plugin.MonitoringPlugin;
 import org.jivesoftware.openfire.reporting.util.TaskEngine;
 import org.jivesoftware.openfire.stats.Statistic;
 import org.jivesoftware.openfire.stats.StatisticsManager;
-import org.jivesoftware.util.*;
+import org.jivesoftware.util.JiveConstants;
+import org.jivesoftware.util.JiveGlobals;
+import org.jivesoftware.util.LocaleUtils;
+import org.jivesoftware.util.NotFoundException;
+import org.jivesoftware.util.PropertyEventDispatcher;
+import org.jivesoftware.util.PropertyEventListener;
+import org.jivesoftware.util.StringUtils;
+import org.jivesoftware.util.SystemProperty;
 import org.jivesoftware.util.cache.CacheFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -52,8 +61,18 @@ import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.*;
-import java.util.concurrent.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.Date;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.TimerTask;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.stream.Stream;
 
 /**
@@ -613,7 +632,7 @@ public class ConversationManager implements ComponentEventListener{
      *
      * @return the active conversations.
      */
-    public Collection<Conversation> getConversations() {
+    public Collection<Conversation> getConversations() throws PluginVersionException {
         if (ClusterManager.isSeniorClusterMember()) {
             List<Conversation> conversationList = new ArrayList<>(conversations.values());
             // Sort the conversations by creation date.
@@ -624,14 +643,30 @@ public class ConversationManager implements ComponentEventListener{
             Collection<String> conversationXmls = CacheFactory.doSynchronousClusterTask(new GetConversationsTask(), ClusterManager
                     .getSeniorClusterMember().toByteArray());
             Collection<Conversation> result = new ArrayList<>();
-            for (String conversationXml : conversationXmls) {
-                try {
-                    Log.debug("Interpreting conversation from: {}", conversationXml);
-                    final Conversation conversation = Conversation.fromXml(conversationXml);
-                    Log.debug("Interpreted conversation: {}", conversation);
-                    result.add(conversation);
-                } catch (IOException e) {
-                    Log.warn("Conversation could not be reconstructed from '{}' because of '{}'. This conversation is not included in the result set.", conversationXml, e.getMessage());
+            if (conversationXmls == null) {
+                Log.warn("The GetConversationsTask returned a null result. This could be caused by the monitoring plugin being unavailable on the senior cluster node.");
+
+                final Map<NodeID, String> remotePluginsWithDifferentVersion = ClusterManager.findRemotePluginsWithDifferentVersion(MonitoringConstants.PLUGIN_NAME);
+                if (remotePluginsWithDifferentVersion.containsKey(ClusterManager.getSeniorClusterMember())) {
+                    // There's another monitoring plugin on the senior node, or none at all
+                    throw new PluginVersionException(
+                        "GetConversationsTask returned a null result",
+                        XMPPServer.getInstance().getPluginManager().getMetadataExtractedPlugins().get(MonitoringConstants.NAME).getVersion().toString(),
+                        remotePluginsWithDifferentVersion
+                    );
+                } else {
+                    // TODO What if plugin versions is not the problem?
+                }
+            } else {
+                for (String conversationXml : conversationXmls) {
+                    try {
+                        Log.debug("Interpreting conversation from: {}", conversationXml);
+                        final Conversation conversation = Conversation.fromXml(conversationXml);
+                        Log.debug("Interpreted conversation: {}", conversation);
+                        result.add(conversation);
+                    } catch (IOException e) {
+                        Log.warn("Conversation could not be reconstructed from '{}' because of '{}'. This conversation is not included in the result set.", conversationXml, e.getMessage());
+                    }
                 }
             }
             return result;
@@ -1130,7 +1165,9 @@ public class ConversationManager implements ComponentEventListener{
 
         // Check all other cluster nodes.
         final Collection<Duration> objects = CacheFactory.doSynchronousClusterTask( new GetConversationsWriteETATask( instant ), false );
-        final Duration maxDuration = objects.stream().max( Comparator.naturalOrder() ).orElse( Duration.ZERO );
+
+        // The collection may contain null objects, for nodes where the monitoring plugin is not installed or unavailable.
+        final Duration maxDuration = objects.stream().filter(Objects::nonNull).max( Comparator.naturalOrder() ).orElse( Duration.ZERO );
         return maxDuration;
     }
 
